@@ -1,1 +1,185 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
 
+name: Build mt7981
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      Cache:
+        description: 'Using cache to speed up OpenWrt compilation.'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrtARM
+  REPO_BRANCH: mt7981
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: mt7981.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Ho_Chi_Minh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: write
+  
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential gawk gcc-multilib g++-multilib gettext libncurses-dev python3-distutils zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH ImmortalWrt
+        ln -sf /workdir/ImmortalWrt $GITHUB_WORKSPACE/ImmortalWrt
+
+    - name: Cache
+      uses: HiGarfield/cachewrtbuild@main
+      if: github.event.inputs.Cache == 'true'
+      with:
+        ccache: 'false'
+        clean: 'false'
+        mixkey: 'aarch64'
+        prefix: ${{ github.workspace }}/ImmortalWrt
+
+    - name: Load custom feeds (DIY_P1_SH)
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF ImmortalWrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd ImmortalWrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd ImmortalWrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd ImmortalWrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration (DIY_P2_SH)
+      run: |
+        [ -e files ] && mv files ImmortalWrt/files
+        chmod +x $DIY_P2_SH
+        cd ImmortalWrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE ImmortalWrt/.config
+        cd ImmortalWrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd ImmortalWrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DEVICE_NAME=_mt7981" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: ImmortalWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ImmortalWrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd ImmortalWrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ImmortalWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "## hanwckf's ImmortalWrt mt7981 Release $(date +"%Y.%m.%d-%H:%M")" >> release.txt
+        echo "- factory.bin" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+        mv ImmortalWrt/.config ImmortalWrt/build.config
+
+    - name: Upload firmware to release
+      uses: mikepenz/action-gh-release@main
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: |
+          ${{ env.FIRMWARE }}/*factory.bin
+          ${{ env.FIRMWARE }}/*sysupgrade.bin
+          ImmortalWrt/build.config
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        retain_days: 1
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
